@@ -1,0 +1,277 @@
+"""
+Login + Excel Test-Result Viewer
+=================================
+A simple Tkinter desktop app that:
+  1. Shows a Login page (username/password).
+  2. After successful login, opens a Main window where you can:
+       - Upload an Excel file (.xlsx / .xls)
+       - View its contents in a scrollable table
+       - Pick the column that holds the test status
+       - See automatic counts of Pass / Fail / Not Testable / Blocked
+
+Requirements:
+    pip install pandas openpyxl
+
+Run:
+    python login_excel_app.py
+
+Default login credentials (change them below):
+    Username: admin
+    Password: admin123
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+VALID_USERNAME = "admin"
+VALID_PASSWORD = "admin123"
+
+# The words we look for when auto-counting statuses.
+# Add / edit synonyms here if your sheet uses different wording.
+STATUS_CATEGORIES = {
+    "Pass":         ["pass", "passed", "ok", "success"],
+    "Fail":         ["fail", "failed", "failure"],
+    "Not Testable": ["not testable", "nt", "n/a", "na", "not applicable"],
+    "Blocked":      ["blocked", "block"],
+}
+
+
+# ----------------------------------------------------------------------
+# LOGIN WINDOW
+# ----------------------------------------------------------------------
+class LoginWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Login")
+        self.geometry("380x260")
+        self.resizable(False, False)
+        self.configure(bg="#f0f2f5")
+
+        self._build_ui()
+
+    def _build_ui(self):
+        card = tk.Frame(self, bg="white", bd=0)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=320, height=220)
+
+        tk.Label(card, text="Sign In", font=("Segoe UI", 16, "bold"),
+                 bg="white", fg="#222").pack(pady=(20, 15))
+
+        # Username
+        frm_user = tk.Frame(card, bg="white")
+        frm_user.pack(fill="x", padx=30, pady=5)
+        tk.Label(frm_user, text="Username", font=("Segoe UI", 9),
+                 bg="white", fg="#555").pack(anchor="w")
+        self.entry_user = ttk.Entry(frm_user, font=("Segoe UI", 10))
+        self.entry_user.pack(fill="x")
+
+        # Password
+        frm_pass = tk.Frame(card, bg="white")
+        frm_pass.pack(fill="x", padx=30, pady=5)
+        tk.Label(frm_pass, text="Password", font=("Segoe UI", 9),
+                 bg="white", fg="#555").pack(anchor="w")
+        self.entry_pass = ttk.Entry(frm_pass, font=("Segoe UI", 10), show="*")
+        self.entry_pass.pack(fill="x")
+
+        # Login button
+        btn = tk.Button(card, text="Login", bg="#2563eb", fg="white",
+                         font=("Segoe UI", 10, "bold"), relief="flat",
+                         activebackground="#1d4ed8", activeforeground="white",
+                         command=self.attempt_login, cursor="hand2")
+        btn.pack(fill="x", padx=30, pady=(18, 5), ipady=6)
+
+        self.bind("<Return>", lambda e: self.attempt_login())
+        self.entry_user.focus_set()
+
+    def attempt_login(self):
+        user = self.entry_user.get().strip()
+        pwd = self.entry_pass.get().strip()
+
+        if user == VALID_USERNAME and pwd == VALID_PASSWORD:
+            self.destroy()
+            app = MainApp()
+            app.mainloop()
+        else:
+            messagebox.showerror("Login Failed", "Invalid username or password.")
+            self.entry_pass.delete(0, tk.END)
+
+
+# ----------------------------------------------------------------------
+# MAIN APP WINDOW (after login)
+# ----------------------------------------------------------------------
+class MainApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Excel Test Result Viewer")
+        self.geometry("1000x600")
+
+        self.df = None  # holds the loaded DataFrame
+
+        self._build_top_bar()
+        self._build_table()
+        self._build_summary_bar()
+
+    # ---------------- UI construction ----------------
+    def _build_top_bar(self):
+        top = tk.Frame(self, bg="#f8f9fa", pady=8)
+        top.pack(fill="x")
+
+        tk.Button(top, text="Upload Excel File", command=self.upload_file,
+                  bg="#2563eb", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=10)
+
+        self.lbl_file = tk.Label(top, text="No file loaded", bg="#f8f9fa",
+                                  font=("Segoe UI", 9), fg="#555")
+        self.lbl_file.pack(side="left", padx=10)
+
+        tk.Label(top, text="Status column:", bg="#f8f9fa",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(30, 5))
+
+        self.status_col_var = tk.StringVar()
+        self.status_col_combo = ttk.Combobox(top, textvariable=self.status_col_var,
+                                              state="readonly", width=25)
+        self.status_col_combo.pack(side="left")
+
+        tk.Button(top, text="Count Results", command=self.count_results,
+                  bg="#16a34a", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=15)
+
+    def _build_table(self):
+        container = tk.Frame(self)
+        container.pack(fill="both", expand=True, padx=10, pady=5)
+
+        vsb = ttk.Scrollbar(container, orient="vertical")
+        hsb = ttk.Scrollbar(container, orient="horizontal")
+
+        self.tree = ttk.Treeview(container, show="headings",
+                                  yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.tree.pack(fill="both", expand=True)
+
+    def _build_summary_bar(self):
+        self.summary_frame = tk.Frame(self, bg="#f0f2f5", pady=10)
+        self.summary_frame.pack(fill="x")
+
+        self.summary_labels = {}
+        colors = {
+            "Pass": "#16a34a",
+            "Fail": "#dc2626",
+            "Not Testable": "#f59e0b",
+            "Blocked": "#6b7280",
+            "Total": "#2563eb",
+        }
+        for name, color in colors.items():
+            box = tk.Frame(self.summary_frame, bg="white", bd=1, relief="solid")
+            box.pack(side="left", padx=10, fill="y")
+
+            tk.Label(box, text=name, bg="white", fg=color,
+                     font=("Segoe UI", 9, "bold")).pack(padx=15, pady=(5, 0))
+            val_lbl = tk.Label(box, text="0", bg="white", fg="#111",
+                                font=("Segoe UI", 16, "bold"))
+            val_lbl.pack(padx=15, pady=(0, 5))
+            self.summary_labels[name] = val_lbl
+
+    # ---------------- Logic ----------------
+    def upload_file(self):
+        path = filedialog.askopenfilename(
+            title="Select Excel File",
+            filetypes=[("Excel files", "*.xlsx *.xls *.xlsm")]
+        )
+        if not path:
+            return
+
+        try:
+            self.df = pd.read_excel(path, dtype=str)
+            self.df = self.df.fillna("")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read the Excel file:\n{e}")
+            return
+
+        self.lbl_file.config(text=path.split("/")[-1].split("\\")[-1])
+        self._populate_table()
+        self._populate_status_columns()
+        self._reset_summary()
+
+    def _populate_table(self):
+        self.tree.delete(*self.tree.get_children())
+        self.tree["columns"] = list(self.df.columns)
+
+        for col in self.df.columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=120, anchor="w")
+
+        for _, row in self.df.iterrows():
+            self.tree.insert("", "end", values=list(row))
+
+    def _populate_status_columns(self):
+        cols = list(self.df.columns)
+        self.status_col_combo["values"] = cols
+
+        # try to auto-select a column that looks like "status" / "result"
+        guess = None
+        for c in cols:
+            lc = c.lower()
+            if "status" in lc or "result" in lc:
+                guess = c
+                break
+        self.status_col_var.set(guess if guess else (cols[0] if cols else ""))
+
+    def _reset_summary(self):
+        for lbl in self.summary_labels.values():
+            lbl.config(text="0")
+
+    def count_results(self):
+        if self.df is None:
+            messagebox.showwarning("No Data", "Please upload an Excel file first.")
+            return
+
+        col = self.status_col_var.get()
+        if not col or col not in self.df.columns:
+            messagebox.showwarning("No Column", "Please select a valid status column.")
+            return
+
+        counts = {k: 0 for k in STATUS_CATEGORIES}
+        unmatched = 0
+
+        for value in self.df[col]:
+            v = str(value).strip().lower()
+            if not v:
+                continue
+            matched = False
+            for category, keywords in STATUS_CATEGORIES.items():
+                if v in keywords:
+                    counts[category] += 1
+                    matched = True
+                    break
+            if not matched:
+                unmatched += 1
+
+        total = sum(counts.values())
+        for name, val in counts.items():
+            self.summary_labels[name].config(text=str(val))
+        self.summary_labels["Total"].config(text=str(total))
+
+        if unmatched:
+            messagebox.showinfo(
+                "Note",
+                f"{unmatched} row(s) had a value in '{col}' that didn't match "
+                f"Pass/Fail/Not Testable/Blocked and were skipped.\n\n"
+                f"You can edit STATUS_CATEGORIES in the script to add more "
+                f"synonyms if needed."
+            )
+
+
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    login = LoginWindow()
+    login.mainloop()
