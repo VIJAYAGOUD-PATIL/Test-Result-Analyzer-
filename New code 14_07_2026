@@ -1,0 +1,444 @@
+"""
+Login + Excel Test-Result Viewer
+=================================
+A Tkinter desktop app that:
+  1. Shows a Login page (username/password).
+  2. After successful login, opens a Main window where you can:
+       - Upload an Excel file (.xlsx / .xls / .xlsm) or CSV
+       - View its contents in a scrollable table that LOOKS like Excel
+         (grid lines, banded rows, bold header row, auto-sized columns)
+       - Pick the column that holds the test status
+       - See automatic counts of Pass / Fail / Not Testable / Blocked
+         in their own separate boxes
+       - See each row shaded in the table according to its status
+
+Requirements:
+    pip install pandas openpyxl
+
+Run:
+    python login_excel_app.py
+
+Default login credentials (change them below):
+    Username: admin
+    Password: admin123
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import csv
+import os
+
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+VALID_USERNAME = "admin"
+VALID_PASSWORD = "admin123"
+
+# The words we look for when auto-counting statuses.
+# Add / edit synonyms here if your sheet uses different wording.
+STATUS_CATEGORIES = {
+    "Pass":         ["pass", "passed", "ok", "success"],
+    "Fail":         ["fail", "failed", "failure"],
+    "Not Testable": ["not testable", "nt", "n/a", "na", "not applicable"],
+    "Blocked":      ["blocked", "block"],
+}
+
+# Colors used to shade table rows and summary boxes for each status.
+STATUS_COLORS = {
+    "Pass":         "#d9f2df",   # light green
+    "Fail":         "#fbdcdc",   # light red
+    "Not Testable": "#fdecc8",   # light amber
+    "Blocked":      "#e2e3e5",   # light gray
+}
+SUMMARY_ACCENTS = {
+    "Pass": "#16a34a",
+    "Fail": "#dc2626",
+    "Not Testable": "#f59e0b",
+    "Blocked": "#6b7280",
+    "Total": "#2563eb",
+}
+
+MAX_COL_WIDTH = 260
+MIN_COL_WIDTH = 70
+CHAR_PIXEL_WIDTH = 8  # rough estimate for auto-sizing columns
+
+
+# ----------------------------------------------------------------------
+# LOGIN WINDOW
+# ----------------------------------------------------------------------
+class LoginWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Login")
+        self.geometry("380x260")
+        self.resizable(False, False)
+        self.configure(bg="#f0f2f5")
+
+        self._build_ui()
+
+    def _build_ui(self):
+        card = tk.Frame(self, bg="white", bd=0)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=320, height=220)
+
+        tk.Label(card, text="Sign In", font=("Segoe UI", 16, "bold"),
+                 bg="white", fg="#222").pack(pady=(20, 15))
+
+        # Username
+        frm_user = tk.Frame(card, bg="white")
+        frm_user.pack(fill="x", padx=30, pady=5)
+        tk.Label(frm_user, text="Username", font=("Segoe UI", 9),
+                 bg="white", fg="#555").pack(anchor="w")
+        self.entry_user = ttk.Entry(frm_user, font=("Segoe UI", 10))
+        self.entry_user.pack(fill="x")
+
+        # Password
+        frm_pass = tk.Frame(card, bg="white")
+        frm_pass.pack(fill="x", padx=30, pady=5)
+        tk.Label(frm_pass, text="Password", font=("Segoe UI", 9),
+                 bg="white", fg="#555").pack(anchor="w")
+        self.entry_pass = ttk.Entry(frm_pass, font=("Segoe UI", 10), show="*")
+        self.entry_pass.pack(fill="x")
+
+        # Login button
+        btn = tk.Button(card, text="Login", bg="#2563eb", fg="white",
+                         font=("Segoe UI", 10, "bold"), relief="flat",
+                         activebackground="#1d4ed8", activeforeground="white",
+                         command=self.attempt_login, cursor="hand2")
+        btn.pack(fill="x", padx=30, pady=(18, 5), ipady=6)
+
+        self.bind("<Return>", lambda e: self.attempt_login())
+        self.entry_user.focus_set()
+
+    def attempt_login(self):
+        user = self.entry_user.get().strip()
+        pwd = self.entry_pass.get().strip()
+
+        if user == VALID_USERNAME and pwd == VALID_PASSWORD:
+            self.destroy()
+            app = MainApp()
+            app.mainloop()
+        else:
+            messagebox.showerror("Login Failed", "Invalid username or password.")
+            self.entry_pass.delete(0, tk.END)
+
+
+# ----------------------------------------------------------------------
+# MAIN APP WINDOW (after login)
+# ----------------------------------------------------------------------
+class MainApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Excel Test Result Viewer")
+        self.geometry("1100x650")
+        self.configure(bg="#f0f2f5")
+
+        self.df = None  # holds the loaded DataFrame
+
+        self._setup_style()
+        self._build_top_bar()
+        self._build_table()
+        self._build_summary_bar()
+
+    # ---------------- Style (this is what makes the table read like Excel) ----------------
+    def _setup_style(self):
+        style = ttk.Style(self)
+        # 'clam' lets us actually control colors/borders, unlike some native themes.
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Excel.Treeview",
+            background="white",
+            fieldbackground="white",
+            rowheight=24,
+            borderwidth=1,
+            relief="solid",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Excel.Treeview.Heading",
+            background="#e8eaed",
+            foreground="#1a1a1a",
+            font=("Segoe UI", 10, "bold"),
+            relief="raised",
+            borderwidth=1,
+        )
+        style.map(
+            "Excel.Treeview",
+            background=[("selected", "#cfe2ff")],
+            foreground=[("selected", "#000000")],
+        )
+
+    # ---------------- UI construction ----------------
+    def _build_top_bar(self):
+        top = tk.Frame(self, bg="#f8f9fa", pady=8)
+        top.pack(fill="x")
+
+        tk.Button(top, text="Upload Excel File", command=self.upload_file,
+                  bg="#2563eb", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=10)
+
+        self.lbl_file = tk.Label(top, text="No file loaded", bg="#f8f9fa",
+                                  font=("Segoe UI", 9), fg="#555")
+        self.lbl_file.pack(side="left", padx=10)
+
+        tk.Label(top, text="Status column:", bg="#f8f9fa",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(30, 5))
+
+        self.status_col_var = tk.StringVar()
+        self.status_col_combo = ttk.Combobox(top, textvariable=self.status_col_var,
+                                              state="readonly", width=25)
+        self.status_col_combo.pack(side="left")
+
+        tk.Button(top, text="Count Results", command=self.count_results,
+                  bg="#16a34a", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=15)
+
+    def _build_table(self):
+        container = tk.Frame(self, bg="#cfcfcf", bd=1)
+        container.pack(fill="both", expand=True, padx=10, pady=5)
+
+        vsb = ttk.Scrollbar(container, orient="vertical")
+        hsb = ttk.Scrollbar(container, orient="horizontal")
+
+        self.tree = ttk.Treeview(container, show="headings",
+                                  yscrollcommand=vsb.set, xscrollcommand=hsb.set,
+                                  style="Excel.Treeview")
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.tree.pack(fill="both", expand=True)
+
+        # Banded (striped) rows, like Excel's alternating shading.
+        self.tree.tag_configure("evenrow", background="#ffffff")
+        self.tree.tag_configure("oddrow", background="#f4f6f8")
+
+        # Status-based row shading, applied on top of banding when a
+        # status column has been counted.
+        for name, color in STATUS_COLORS.items():
+            self.tree.tag_configure(f"status_{name}", background=color)
+
+    def _build_summary_bar(self):
+        self.summary_frame = tk.Frame(self, bg="#f0f2f5", pady=10)
+        self.summary_frame.pack(fill="x")
+
+        self.summary_labels = {}
+        for name, color in SUMMARY_ACCENTS.items():
+            box = tk.Frame(self.summary_frame, bg="white", bd=1, relief="solid")
+            box.pack(side="left", padx=10, fill="y")
+
+            tk.Label(box, text=name, bg="white", fg=color,
+                     font=("Segoe UI", 9, "bold")).pack(padx=15, pady=(5, 0))
+            val_lbl = tk.Label(box, text="0", bg="white", fg="#111",
+                                font=("Segoe UI", 16, "bold"))
+            val_lbl.pack(padx=15, pady=(0, 5))
+            self.summary_labels[name] = val_lbl
+
+    # ---------------- Logic ----------------
+    def upload_file(self):
+        path = filedialog.askopenfilename(
+            title="Select Excel or CSV File",
+            filetypes=[
+                ("Excel/CSV files", "*.xlsx *.xls *.xlsm *.csv"),
+                ("Excel files", "*.xlsx *.xls *.xlsm"),
+                ("CSV files", "*.csv"),
+            ]
+        )
+        if not path:
+            return
+
+        try:
+            self.df = self._load_file(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read the file:\n{e}")
+            return
+
+        if self.df is None or self.df.empty:
+            messagebox.showwarning("Empty File", "No data was found in that file.")
+            return
+
+        self.lbl_file.config(text=os.path.basename(path))
+        self._populate_table()
+        self._populate_status_columns()
+        self._reset_summary()
+
+        # Auto-run the count right after loading, for convenience.
+        self.count_results()
+
+    def _load_file(self, path):
+        """
+        Loads an Excel or CSV file robustly, fixing the two most common
+        causes of 'columns missing / wrong data':
+          1. CSV files using semicolons/tabs instead of commas.
+          2. Excel files with a title row (or blank rows) above the
+             real header row, which would otherwise get read as headers.
+        """
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext == ".csv":
+            df = self._load_csv(path)
+        else:
+            df = self._load_excel(path)
+
+        return df
+
+    def _load_csv(self, path):
+        # Sniff the delimiter instead of assuming a comma.
+        with open(path, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
+            sample = f.read(4096)
+
+        delimiter = ","
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+            delimiter = dialect.delimiter
+        except csv.Error:
+            pass  # fall back to comma if sniffing fails
+
+        df = pd.read_csv(path, sep=delimiter, dtype=str, encoding="utf-8-sig")
+        df = self._clean_dataframe(df)
+        return df
+
+    def _load_excel(self, path):
+        # Read with no header assumption so we can find the real header
+        # row ourselves (skips title rows, logos, blank rows above the
+        # actual table).
+        raw = pd.read_excel(path, header=None, dtype=str)
+        raw = raw.fillna("")
+
+        header_row_idx = 0
+        for i, row in raw.iterrows():
+            non_empty = sum(1 for v in row if str(v).strip() != "")
+            if non_empty >= 2:
+                header_row_idx = i
+                break
+
+        headers_raw = list(raw.iloc[header_row_idx])
+        seen = {}
+        headers = []
+        for j, h in enumerate(headers_raw):
+            name = str(h).strip()
+            if not name:
+                name = f"Column {j + 1}"
+            if name in seen:
+                seen[name] += 1
+                name = f"{name} ({seen[name]})"
+            else:
+                seen[name] = 0
+            headers.append(name)
+
+        data = raw.iloc[header_row_idx + 1:].copy()
+        data.columns = headers
+        data = data.reset_index(drop=True)
+
+        # Drop fully blank rows.
+        data = data[~(data.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
+        data = data.reset_index(drop=True)
+
+        return self._clean_dataframe(data)
+
+    def _clean_dataframe(self, df):
+        df = df.fillna("")
+        df.columns = [str(c).strip() for c in df.columns]
+        # Drop rows that are entirely blank.
+        df = df[~(df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
+        df = df.reset_index(drop=True)
+        return df
+
+    def _populate_table(self):
+        self.tree.delete(*self.tree.get_children())
+        columns = list(self.df.columns)
+        self.tree["columns"] = columns
+
+        for col in columns:
+            self.tree.heading(col, text=col, anchor="center")
+            # Auto-size each column based on the widest value in it,
+            # capped so one huge cell doesn't blow out the layout.
+            longest = max(
+                [len(str(col))] + [len(str(v)) for v in self.df[col].astype(str).values[:500]]
+            )
+            width = min(MAX_COL_WIDTH, max(MIN_COL_WIDTH, longest * CHAR_PIXEL_WIDTH))
+            self.tree.column(col, width=width, anchor="w", stretch=False)
+
+        for idx, (_, row) in enumerate(self.df.iterrows()):
+            band_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            self.tree.insert("", "end", iid=str(idx), values=list(row), tags=(band_tag,))
+
+    def _populate_status_columns(self):
+        cols = list(self.df.columns)
+        self.status_col_combo["values"] = cols
+
+        # try to auto-select a column that looks like "status" / "result"
+        guess = None
+        for c in cols:
+            lc = c.lower()
+            if "status" in lc or "result" in lc:
+                guess = c
+                break
+        self.status_col_var.set(guess if guess else (cols[0] if cols else ""))
+
+    def _reset_summary(self):
+        for lbl in self.summary_labels.values():
+            lbl.config(text="0")
+
+    def _classify(self, value):
+        """Return the matching status category name for a cell value, or None."""
+        v = str(value).strip().lower()
+        if not v:
+            return None
+        for category, keywords in STATUS_CATEGORIES.items():
+            if v in keywords:
+                return category
+        return None
+
+    def count_results(self):
+        if self.df is None:
+            messagebox.showwarning("No Data", "Please upload an Excel file first.")
+            return
+
+        col = self.status_col_var.get()
+        if not col or col not in self.df.columns:
+            messagebox.showwarning("No Column", "Please select a valid status column.")
+            return
+
+        counts = {k: 0 for k in STATUS_CATEGORIES}
+        unmatched = 0
+
+        for idx, value in self.df[col].items():
+            category = self._classify(value)
+            band_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            if category:
+                counts[category] += 1
+                # Shade the row in the table so Pass/Fail/etc. is visible at a glance.
+                self.tree.item(str(idx), tags=(band_tag, f"status_{category}"))
+            else:
+                if str(value).strip():
+                    unmatched += 1
+                self.tree.item(str(idx), tags=(band_tag,))
+
+        total = sum(counts.values())
+        for name, val in counts.items():
+            self.summary_labels[name].config(text=str(val))
+        self.summary_labels["Total"].config(text=str(total))
+
+        if unmatched:
+            messagebox.showinfo(
+                "Note",
+                f"{unmatched} row(s) had a value in '{col}' that didn't match "
+                f"Pass/Fail/Not Testable/Blocked and were skipped.\n\n"
+                f"You can edit STATUS_CATEGORIES near the top of the script "
+                f"to add more synonyms if needed."
+            )
+
+
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    login = LoginWindow()
+    login.mainloop()
