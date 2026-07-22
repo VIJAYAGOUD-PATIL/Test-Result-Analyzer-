@@ -1,0 +1,199 @@
+import requests
+import pandas as pd
+import re
+from requests.auth import HTTPBasicAuth
+
+# ----------------------------------------------------
+# Configuration
+# ----------------------------------------------------
+CODEBEAMER_URL = "https://your-server/cb/rest"
+USERNAME = "username"
+PASSWORD = "password"
+
+TRACKER_ID = 12345
+
+AMBIGUOUS_WORDS = [
+    "fast", "quick", "efficient", "easy", "user-friendly",
+    "adequate", "appropriate", "approximately", "about",
+    "etc", "normal", "large", "small", "minimal",
+    "maximum", "minimum", "soon", "optimum", "sufficient"
+]
+
+WEAK_WORDS = [
+    "should", "may", "might", "can", "could", "possibly",
+    "normally", "typically", "usually"
+]
+
+PASSIVE_WORDS = [
+    "is", "are", "was", "were", "been", "being"
+]
+
+# ----------------------------------------------------
+# Download Requirements
+# ----------------------------------------------------
+url = f"{CODEBEAMER_URL}/tracker/{TRACKER_ID}/items"
+
+try:
+    response = requests.get(
+        url,
+        auth=HTTPBasicAuth(USERNAME, PASSWORD),
+        timeout=30
+    )
+    response.raise_for_status()
+except requests.exceptions.RequestException as e:
+    print(f"Failed to fetch requirements from Codebeamer: {e}")
+    raise SystemExit(1)
+
+data = response.json()
+
+# Codebeamer's REST API typically wraps results in an "items" key.
+# Handle both a raw list and a dict-with-items response shape.
+if isinstance(data, dict):
+    requirements = data.get("items", [])
+else:
+    requirements = data
+
+report = []
+
+# ----------------------------------------------------
+# Requirement Analysis
+# ----------------------------------------------------
+for req in requirements:
+
+    score = 100
+    issues = []
+    recommendation = []
+
+    title = req.get("name", "") or ""
+    desc = req.get("description", "") or ""
+    text = (title + " " + desc).lower()
+
+    priority = (req.get("priority") or {}).get("name", "")
+    status = (req.get("status") or {}).get("name", "")
+
+    # ------------------------
+    # Title
+    # ------------------------
+    if len(title.strip()) == 0:
+        score -= 15
+        issues.append("Missing title")
+        recommendation.append("Provide a meaningful requirement title.")
+
+    # ------------------------
+    # Description
+    # ------------------------
+    if len(desc.strip()) == 0:
+        score -= 25
+        issues.append("Missing description")
+        recommendation.append("Describe the requirement completely.")
+
+    # ------------------------
+    # Requirement Length
+    # ------------------------
+    words = len(desc.split())
+
+    if words < 12:
+        score -= 10
+        issues.append("Requirement too short")
+        recommendation.append("Provide more implementation-independent detail.")
+
+    if words > 80:
+        score -= 5
+        issues.append("Requirement too long")
+        recommendation.append("Split into multiple requirements.")
+
+    # ------------------------
+    # Testability
+    # ------------------------
+    if "shall" not in text:
+        score -= 15
+        issues.append("Missing SHALL statement")
+        recommendation.append("Use SHALL for mandatory requirements.")
+
+    # ------------------------
+    # Weak Words
+    # ------------------------
+    weak = []
+    for w in WEAK_WORDS:
+        if re.search(r"\b" + re.escape(w) + r"\b", text):
+            weak.append(w)
+
+    if weak:
+        score -= 10
+        issues.append("Weak wording: " + ",".join(weak))
+        recommendation.append("Replace SHOULD/MAY with SHALL where applicable.")
+
+    # ------------------------
+    # Ambiguous Words
+    # ------------------------
+    ambiguous = []
+    for w in AMBIGUOUS_WORDS:
+        if re.search(r"\b" + re.escape(w) + r"\b", text):
+            ambiguous.append(w)
+
+    if ambiguous:
+        score -= 10
+        issues.append("Ambiguous wording: " + ",".join(ambiguous))
+        recommendation.append("Replace subjective words with measurable values.")
+
+    # ------------------------
+    # Passive Voice
+    # ------------------------
+    passive = []
+    for w in PASSIVE_WORDS:
+        if re.search(r"\b" + re.escape(w) + r"\b", text):
+            passive.append(w)
+
+    if passive:
+        score -= 5
+        issues.append("Possible passive voice")
+        recommendation.append("Use active voice.")
+
+    # ------------------------
+    # Numeric Acceptance Criteria
+    # ------------------------
+    if not re.search(r"\d", text):
+        score -= 5
+        issues.append("No measurable acceptance criteria")
+        recommendation.append("Specify measurable values (time, voltage, speed, accuracy, etc.).")
+
+    # ------------------------
+    # Priority
+    # ------------------------
+    if priority == "":
+        score -= 5
+        issues.append("Missing priority")
+        recommendation.append("Assign a priority level to the requirement.")
+
+    # ------------------------
+    # Status
+    # ------------------------
+    if status == "":
+        score -= 5
+        issues.append("Missing status")
+        recommendation.append("Set a workflow status for the requirement.")
+
+    # ------------------------
+    # Clamp score and store result
+    # ------------------------
+    score = max(score, 0)
+
+    report.append({
+        "ID": req.get("id", ""),
+        "Title": title,
+        "Priority": priority,
+        "Status": status,
+        "Score": score,
+        "Issues": "; ".join(issues) if issues else "None",
+        "Recommendations": "; ".join(recommendation) if recommendation else "None"
+    })
+
+# ----------------------------------------------------
+# Save Report
+# ----------------------------------------------------
+df = pd.DataFrame(report)
+output_path = "requirement_quality_report.xlsx"
+df.to_excel(output_path, index=False)
+
+print(f"Analyzed {len(report)} requirements.")
+print(f"Report saved to: {output_path}")
