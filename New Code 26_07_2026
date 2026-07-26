@@ -1,0 +1,884 @@
+"""
+Login + Dashboard + Excel Test-Result Tools
+============================================
+A Tkinter desktop app that:
+  1. Shows a Login page (username/password).
+  2. After successful login, opens a Dashboard with two options:
+
+     Option 1 - "Excel/CSV Viewer"
+         - Upload an Excel (.xlsx/.xls/.xlsm) or CSV file
+         - View its contents in a scrollable table that LOOKS like Excel
+         - Pick the column that holds the test status
+         - See automatic counts of Pass / Fail / Not Testable / Blocked
+
+     Option 2 - "SyRs Pass/Fail"
+         - Upload an Excel or CSV file
+         - Pick the "Verifies" column (requirement / SyRs id each row maps to)
+         - Pick the "Result" column (Pass/Fail/Not Testable/Blocked)
+         - Not Testable + Blocked are combined into a single "Blocked" bucket
+         - Duplicate "Verifies" ids (the same requirement covered by more
+           than one test row) are de-duplicated to ONE final verdict per id,
+           decided individually (not by comparing every row to every other
+           row) using this priority: Blocked > Fail > Pass
+         - Duplicate/conflicting rows are conditionally formatted (highlighted)
+           in the table so you can see at a glance where a requirement was
+           tested more than once
+         - Final Pass / Fail / Blocked counts + the list of Verifies names
+           in each bucket are shown
+
+Requirements:
+    pip install pandas openpyxl
+
+Run:
+    python test.py
+
+Default login credentials (change them below):
+    Username: admin
+    Password: admin123
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import csv
+import os
+
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+VALID_USERNAME = "admin"
+VALID_PASSWORD = "admin123"
+
+# The words we look for when auto-counting statuses.
+# Add / edit synonyms here if your sheet uses different wording.
+STATUS_CATEGORIES = {
+    "Pass":         ["pass", "passed", "ok", "success"],
+    "Fail":         ["fail", "failed", "failure"],
+    "Not Testable": ["not testable", "nt", "n/a", "na", "not applicable"],
+    "Blocked":      ["blocked", "block"],
+}
+
+# Colors used to shade table rows and summary boxes for each status
+# (used by the Excel/CSV Viewer, which keeps all four categories separate).
+STATUS_COLORS = {
+    "Pass":         "#d9f2df",   # light green
+    "Fail":         "#fbdcdc",   # light red
+    "Not Testable": "#fdecc8",   # light amber
+    "Blocked":      "#e2e3e5",   # light gray
+}
+SUMMARY_ACCENTS = {
+    "Pass": "#16a34a",
+    "Fail": "#dc2626",
+    "Not Testable": "#f59e0b",
+    "Blocked": "#6b7280",
+    "Total": "#2563eb",
+}
+
+# Colors for the SyRs Pass/Fail tool, where Not Testable + Blocked are
+# merged into one combined "Blocked" bucket.
+SYRS_STATUS_COLORS = {
+    "Pass":    "#d9f2df",   # light green
+    "Fail":    "#fbdcdc",   # light red
+    "Blocked": "#e2e3e5",   # light gray (covers Blocked + Not Testable)
+}
+SYRS_SUMMARY_ACCENTS = {
+    "Pass": "#16a34a",
+    "Fail": "#dc2626",
+    "Blocked": "#6b7280",
+    "Total": "#2563eb",
+}
+# Highlight color for rows whose Verifies id shows up more than once
+# (i.e. the requirement was tested by more than one row).
+DUPLICATE_HIGHLIGHT = "#fff3b0"   # light yellow
+
+# Priority used to decide the ONE final verdict for a Verifies id that
+# appears on more than one row: Blocked beats Fail beats Pass.
+SYRS_PRIORITY = ["Blocked", "Fail", "Pass"]
+
+MAX_COL_WIDTH = 260
+MIN_COL_WIDTH = 70
+CHAR_PIXEL_WIDTH = 8  # rough estimate for auto-sizing columns
+
+
+# ----------------------------------------------------------------------
+# SHARED FILE-LOADING HELPERS
+# (used by both the Excel/CSV Viewer and the SyRs Pass/Fail tool)
+# ----------------------------------------------------------------------
+def load_file(path):
+    """
+    Loads an Excel or CSV file robustly, fixing the two most common
+    causes of 'columns missing / wrong data':
+      1. CSV files using semicolons/tabs instead of commas.
+      2. Excel files with a title row (or blank rows) above the
+         real header row, which would otherwise get read as headers.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        return _load_csv(path)
+    return _load_excel(path)
+
+
+def _load_csv(path):
+    # Sniff the delimiter instead of assuming a comma.
+    with open(path, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
+        sample = f.read(4096)
+
+    delimiter = ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+        delimiter = dialect.delimiter
+    except csv.Error:
+        pass  # fall back to comma if sniffing fails
+
+    df = pd.read_csv(path, sep=delimiter, dtype=str, encoding="utf-8-sig")
+    return _clean_dataframe(df)
+
+
+def _load_excel(path):
+    # Read with no header assumption so we can find the real header
+    # row ourselves (skips title rows, logos, blank rows above the
+    # actual table).
+    raw = pd.read_excel(path, header=None, dtype=str)
+    raw = raw.fillna("")
+
+    header_row_idx = 0
+    for i, row in raw.iterrows():
+        non_empty = sum(1 for v in row if str(v).strip() != "")
+        if non_empty >= 2:
+            header_row_idx = i
+            break
+
+    headers_raw = list(raw.iloc[header_row_idx])
+    seen = {}
+    headers = []
+    for j, h in enumerate(headers_raw):
+        name = str(h).strip()
+        if not name:
+            name = f"Column {j + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 0
+        headers.append(name)
+
+    data = raw.iloc[header_row_idx + 1:].copy()
+    data.columns = headers
+    data = data.reset_index(drop=True)
+
+    # Drop fully blank rows.
+    data = data[~(data.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
+    data = data.reset_index(drop=True)
+
+    return _clean_dataframe(data)
+
+
+def _clean_dataframe(df):
+    df = df.fillna("")
+    df.columns = [str(c).strip() for c in df.columns]
+    # Drop rows that are entirely blank.
+    df = df[~(df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
+    df = df.reset_index(drop=True)
+    return df
+
+
+def classify_status(value):
+    """Return the matching status category name for a cell value, or None."""
+    v = str(value).strip().lower()
+    if not v:
+        return None
+    for category, keywords in STATUS_CATEGORIES.items():
+        if v in keywords:
+            return category
+    return None
+
+
+def guess_column(cols, keywords):
+    """Return the first column name whose lowercase text contains any keyword."""
+    for c in cols:
+        lc = c.lower()
+        if any(k in lc for k in keywords):
+            return c
+    return cols[0] if cols else ""
+
+
+# ----------------------------------------------------------------------
+# LOGIN WINDOW
+# ----------------------------------------------------------------------
+class LoginWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Login")
+        self.geometry("380x260")
+        self.resizable(False, False)
+        self.configure(bg="#f0f2f5")
+
+        self._build_ui()
+
+    def _build_ui(self):
+        card = tk.Frame(self, bg="white", bd=0)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=320, height=220)
+
+        tk.Label(card, text="Sign In", font=("Segoe UI", 16, "bold"),
+                 bg="white", fg="#222").pack(pady=(20, 15))
+
+        # Username
+        frm_user = tk.Frame(card, bg="white")
+        frm_user.pack(fill="x", padx=30, pady=5)
+        tk.Label(frm_user, text="Username", font=("Segoe UI", 9),
+                 bg="white", fg="#555").pack(anchor="w")
+        self.entry_user = ttk.Entry(frm_user, font=("Segoe UI", 10))
+        self.entry_user.pack(fill="x")
+
+        # Password
+        frm_pass = tk.Frame(card, bg="white")
+        frm_pass.pack(fill="x", padx=30, pady=5)
+        tk.Label(frm_pass, text="Password", font=("Segoe UI", 9),
+                 bg="white", fg="#555").pack(anchor="w")
+        self.entry_pass = ttk.Entry(frm_pass, font=("Segoe UI", 10), show="*")
+        self.entry_pass.pack(fill="x")
+
+        # Login button
+        btn = tk.Button(card, text="Login", bg="#2563eb", fg="white",
+                         font=("Segoe UI", 10, "bold"), relief="flat",
+                         activebackground="#1d4ed8", activeforeground="white",
+                         command=self.attempt_login, cursor="hand2")
+        btn.pack(fill="x", padx=30, pady=(18, 5), ipady=6)
+
+        self.bind("<Return>", lambda e: self.attempt_login())
+        self.entry_user.focus_set()
+
+    def attempt_login(self):
+        user = self.entry_user.get().strip()
+        pwd = self.entry_pass.get().strip()
+
+        if user == VALID_USERNAME and pwd == VALID_PASSWORD:
+            self.destroy()
+            app = Dashboard()
+            app.mainloop()
+        else:
+            messagebox.showerror("Login Failed", "Invalid username or password.")
+            self.entry_pass.delete(0, tk.END)
+
+
+# ----------------------------------------------------------------------
+# DASHBOARD (shown right after login)
+# ----------------------------------------------------------------------
+class Dashboard(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Dashboard")
+        self.geometry("520x360")
+        self.resizable(False, False)
+        self.configure(bg="#f0f2f5")
+        self._build_ui()
+
+    def _build_ui(self):
+        tk.Label(self, text="Dashboard", font=("Segoe UI", 18, "bold"),
+                 bg="#f0f2f5", fg="#222").pack(pady=(30, 5))
+        tk.Label(self, text="Choose a tool to continue",
+                 font=("Segoe UI", 10), bg="#f0f2f5", fg="#555").pack(pady=(0, 20))
+
+        cards = tk.Frame(self, bg="#f0f2f5")
+        cards.pack(expand=True, fill="both", padx=30)
+
+        self._build_card(
+            cards,
+            title="Excel / CSV Viewer",
+            desc="Upload a file, view it like Excel, pick a status\n"
+                 "column and get Pass / Fail / Not Testable / Blocked counts.",
+            color="#2563eb",
+            command=self.open_excel_viewer,
+        ).pack(side="left", expand=True, fill="both", padx=(0, 10))
+
+        self._build_card(
+            cards,
+            title="SyRs Pass / Fail",
+            desc="Upload a file, pick the Verifies column + Result column.\n"
+                 "Duplicates are resolved by priority: Blocked > Fail > Pass.",
+            color="#16a34a",
+            command=self.open_syrs_tool,
+        ).pack(side="left", expand=True, fill="both", padx=(10, 0))
+
+    def _build_card(self, parent, title, desc, color, command):
+        card = tk.Frame(parent, bg="white", bd=1, relief="solid")
+
+        tk.Label(card, text=title, font=("Segoe UI", 12, "bold"),
+                 bg="white", fg="#222").pack(pady=(20, 8), padx=15)
+        tk.Label(card, text=desc, font=("Segoe UI", 9), bg="white",
+                 fg="#555", justify="left").pack(padx=15, pady=(0, 15))
+
+        tk.Button(card, text="Open", command=command, bg=color, fg="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(pady=(0, 20))
+        return card
+
+    def open_excel_viewer(self):
+        ExcelViewerWindow(self)
+
+    def open_syrs_tool(self):
+        SyrsPassFailWindow(self)
+
+
+# ----------------------------------------------------------------------
+# OPTION 1 - EXCEL / CSV VIEWER (the original tool, now a Toplevel window
+# launched from the Dashboard)
+# ----------------------------------------------------------------------
+class ExcelViewerWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Excel / CSV Viewer")
+        self.geometry("1100x650")
+        self.configure(bg="#f0f2f5")
+
+        self.df = None  # holds the loaded DataFrame
+
+        self._setup_style()
+        self._build_top_bar()
+        self._build_table()
+        self._build_summary_bar()
+
+    # ---------------- Style (this is what makes the table read like Excel) ----------------
+    def _setup_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Excel.Treeview",
+            background="white",
+            fieldbackground="white",
+            rowheight=24,
+            borderwidth=1,
+            relief="solid",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Excel.Treeview.Heading",
+            background="#e8eaed",
+            foreground="#1a1a1a",
+            font=("Segoe UI", 10, "bold"),
+            relief="raised",
+            borderwidth=1,
+        )
+        style.map(
+            "Excel.Treeview",
+            background=[("selected", "#cfe2ff")],
+            foreground=[("selected", "#000000")],
+        )
+
+    # ---------------- UI construction ----------------
+    def _build_top_bar(self):
+        top = tk.Frame(self, bg="#f8f9fa", pady=8)
+        top.pack(fill="x")
+
+        tk.Button(top, text="Upload Excel File", command=self.upload_file,
+                  bg="#2563eb", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=10)
+
+        self.lbl_file = tk.Label(top, text="No file loaded", bg="#f8f9fa",
+                                  font=("Segoe UI", 9), fg="#555")
+        self.lbl_file.pack(side="left", padx=10)
+
+        tk.Label(top, text="Status column:", bg="#f8f9fa",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(30, 5))
+
+        self.status_col_var = tk.StringVar()
+        self.status_col_combo = ttk.Combobox(top, textvariable=self.status_col_var,
+                                              state="readonly", width=25)
+        self.status_col_combo.pack(side="left")
+
+        tk.Button(top, text="Count Results", command=self.count_results,
+                  bg="#16a34a", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=15)
+
+    def _build_table(self):
+        container = tk.Frame(self, bg="#cfcfcf", bd=1)
+        container.pack(fill="both", expand=True, padx=10, pady=5)
+
+        vsb = ttk.Scrollbar(container, orient="vertical")
+        hsb = ttk.Scrollbar(container, orient="horizontal")
+
+        self.tree = ttk.Treeview(container, show="headings",
+                                  yscrollcommand=vsb.set, xscrollcommand=hsb.set,
+                                  style="Excel.Treeview")
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.tree.pack(fill="both", expand=True)
+
+        # Banded (striped) rows, like Excel's alternating shading.
+        self.tree.tag_configure("evenrow", background="#ffffff")
+        self.tree.tag_configure("oddrow", background="#f4f6f8")
+
+        # Status-based row shading, applied on top of banding when a
+        # status column has been counted.
+        for name, color in STATUS_COLORS.items():
+            self.tree.tag_configure(f"status_{name}", background=color)
+
+    def _build_summary_bar(self):
+        self.summary_frame = tk.Frame(self, bg="#f0f2f5", pady=10)
+        self.summary_frame.pack(fill="x")
+
+        self.summary_labels = {}
+        for name, color in SUMMARY_ACCENTS.items():
+            box = tk.Frame(self.summary_frame, bg="white", bd=1, relief="solid")
+            box.pack(side="left", padx=10, fill="y")
+
+            tk.Label(box, text=name, bg="white", fg=color,
+                     font=("Segoe UI", 9, "bold")).pack(padx=15, pady=(5, 0))
+            val_lbl = tk.Label(box, text="0", bg="white", fg="#111",
+                                font=("Segoe UI", 16, "bold"))
+            val_lbl.pack(padx=15, pady=(0, 5))
+            self.summary_labels[name] = val_lbl
+
+    # ---------------- Logic ----------------
+    def upload_file(self):
+        path = filedialog.askopenfilename(
+            title="Select Excel or CSV File",
+            filetypes=[
+                ("Excel/CSV files", "*.xlsx *.xls *.xlsm *.csv"),
+                ("Excel files", "*.xlsx *.xls *.xlsm"),
+                ("CSV files", "*.csv"),
+            ]
+        )
+        if not path:
+            return
+
+        try:
+            self.df = load_file(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read the file:\n{e}")
+            return
+
+        if self.df is None or self.df.empty:
+            messagebox.showwarning("Empty File", "No data was found in that file.")
+            return
+
+        self.lbl_file.config(text=os.path.basename(path))
+        self._populate_table()
+        self._populate_status_columns()
+        self._reset_summary()
+
+        # Auto-run the count right after loading, for convenience.
+        self.count_results()
+
+    def _populate_table(self):
+        self.tree.delete(*self.tree.get_children())
+        columns = list(self.df.columns)
+        self.tree["columns"] = columns
+
+        for col in columns:
+            self.tree.heading(col, text=col, anchor="center")
+            longest = max(
+                [len(str(col))] + [len(str(v)) for v in self.df[col].astype(str).values[:500]]
+            )
+            width = min(MAX_COL_WIDTH, max(MIN_COL_WIDTH, longest * CHAR_PIXEL_WIDTH))
+            self.tree.column(col, width=width, anchor="w", stretch=False)
+
+        for idx, (_, row) in enumerate(self.df.iterrows()):
+            band_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            self.tree.insert("", "end", iid=str(idx), values=list(row), tags=(band_tag,))
+
+    def _populate_status_columns(self):
+        cols = list(self.df.columns)
+        self.status_col_combo["values"] = cols
+        guess = guess_column(cols, ["status", "result"])
+        self.status_col_var.set(guess)
+
+    def _reset_summary(self):
+        for lbl in self.summary_labels.values():
+            lbl.config(text="0")
+
+    def count_results(self):
+        if self.df is None:
+            messagebox.showwarning("No Data", "Please upload an Excel file first.")
+            return
+
+        col = self.status_col_var.get()
+        if not col or col not in self.df.columns:
+            messagebox.showwarning("No Column", "Please select a valid status column.")
+            return
+
+        counts = {k: 0 for k in STATUS_CATEGORIES}
+        unmatched = 0
+
+        for idx, value in self.df[col].items():
+            category = classify_status(value)
+            band_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            if category:
+                counts[category] += 1
+                self.tree.item(str(idx), tags=(band_tag, f"status_{category}"))
+            else:
+                if str(value).strip():
+                    unmatched += 1
+                self.tree.item(str(idx), tags=(band_tag,))
+
+        total = sum(counts.values())
+        for name, val in counts.items():
+            self.summary_labels[name].config(text=str(val))
+        self.summary_labels["Total"].config(text=str(total))
+
+        if unmatched:
+            messagebox.showinfo(
+                "Note",
+                f"{unmatched} row(s) had a value in '{col}' that didn't match "
+                f"Pass/Fail/Not Testable/Blocked and were skipped.\n\n"
+                f"You can edit STATUS_CATEGORIES near the top of the script "
+                f"to add more synonyms if needed."
+            )
+
+
+# ----------------------------------------------------------------------
+# OPTION 2 - SyRs PASS / FAIL TOOL
+# ----------------------------------------------------------------------
+class SyrsPassFailWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("SyRs Pass / Fail")
+        self.geometry("1200x700")
+        self.configure(bg="#f0f2f5")
+
+        self.df = None
+
+        self._setup_style()
+        self._build_top_bar()
+        self._build_table()
+        self._build_summary_and_lists()
+
+    # ---------------- Style ----------------
+    def _setup_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Syrs.Treeview",
+            background="white",
+            fieldbackground="white",
+            rowheight=24,
+            borderwidth=1,
+            relief="solid",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Syrs.Treeview.Heading",
+            background="#e8eaed",
+            foreground="#1a1a1a",
+            font=("Segoe UI", 10, "bold"),
+            relief="raised",
+            borderwidth=1,
+        )
+        style.map(
+            "Syrs.Treeview",
+            background=[("selected", "#cfe2ff")],
+            foreground=[("selected", "#000000")],
+        )
+
+    # ---------------- UI construction ----------------
+    def _build_top_bar(self):
+        top = tk.Frame(self, bg="#f8f9fa", pady=8)
+        top.pack(fill="x")
+
+        row1 = tk.Frame(top, bg="#f8f9fa")
+        row1.pack(fill="x")
+
+        tk.Button(row1, text="Upload Excel/CSV File", command=self.upload_file,
+                  bg="#2563eb", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=10)
+
+        self.lbl_file = tk.Label(row1, text="No file loaded", bg="#f8f9fa",
+                                  font=("Segoe UI", 9), fg="#555")
+        self.lbl_file.pack(side="left", padx=10)
+
+        row2 = tk.Frame(top, bg="#f8f9fa")
+        row2.pack(fill="x", pady=(8, 0))
+
+        tk.Label(row2, text="Verifies column:", bg="#f8f9fa",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(10, 5))
+        self.verify_col_var = tk.StringVar()
+        self.verify_col_combo = ttk.Combobox(row2, textvariable=self.verify_col_var,
+                                              state="readonly", width=22)
+        self.verify_col_combo.pack(side="left")
+
+        tk.Label(row2, text="Result column:", bg="#f8f9fa",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(20, 5))
+        self.result_col_var = tk.StringVar()
+        self.result_col_combo = ttk.Combobox(row2, textvariable=self.result_col_var,
+                                              state="readonly", width=22)
+        self.result_col_combo.pack(side="left")
+
+        tk.Button(row2, text="Analyze", command=self.analyze,
+                  bg="#16a34a", fg="white", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=14, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=15)
+
+        legend = tk.Frame(top, bg="#f8f9fa")
+        legend.pack(fill="x", pady=(8, 0), padx=10)
+        tk.Label(legend, text="Legend:", bg="#f8f9fa", font=("Segoe UI", 8, "bold"),
+                 fg="#555").pack(side="left")
+        for name, color in SYRS_STATUS_COLORS.items():
+            sw = tk.Label(legend, text="  ", bg=color, relief="solid", bd=1)
+            sw.pack(side="left", padx=(10, 2))
+            tk.Label(legend, text=name, bg="#f8f9fa", font=("Segoe UI", 8),
+                     fg="#555").pack(side="left")
+        sw = tk.Label(legend, text="  ", bg=DUPLICATE_HIGHLIGHT, relief="solid", bd=1)
+        sw.pack(side="left", padx=(10, 2))
+        tk.Label(legend, text="Duplicate Verifies id (multiple rows)", bg="#f8f9fa",
+                 font=("Segoe UI", 8), fg="#555").pack(side="left")
+
+    def _build_table(self):
+        container = tk.Frame(self, bg="#cfcfcf", bd=1)
+        container.pack(fill="both", expand=True, padx=10, pady=5)
+
+        vsb = ttk.Scrollbar(container, orient="vertical")
+        hsb = ttk.Scrollbar(container, orient="horizontal")
+
+        self.tree = ttk.Treeview(container, show="headings",
+                                  yscrollcommand=vsb.set, xscrollcommand=hsb.set,
+                                  style="Syrs.Treeview")
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.tree.pack(fill="both", expand=True)
+
+        self.tree.tag_configure("evenrow", background="#ffffff")
+        self.tree.tag_configure("oddrow", background="#f4f6f8")
+
+        for name, color in SYRS_STATUS_COLORS.items():
+            self.tree.tag_configure(f"final_{name}", background=color)
+        # Duplicate tag is applied last (on top) so it wins visually.
+        self.tree.tag_configure("duplicate", background=DUPLICATE_HIGHLIGHT)
+
+    def _build_summary_and_lists(self):
+        bottom = tk.Frame(self, bg="#f0f2f5")
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+
+        # ---- Summary count boxes ----
+        summary_frame = tk.Frame(bottom, bg="#f0f2f5", pady=6)
+        summary_frame.pack(fill="x")
+
+        self.summary_labels = {}
+        for name, color in SYRS_SUMMARY_ACCENTS.items():
+            box = tk.Frame(summary_frame, bg="white", bd=1, relief="solid")
+            box.pack(side="left", padx=10, fill="y")
+
+            tk.Label(box, text=name, bg="white", fg=color,
+                     font=("Segoe UI", 9, "bold")).pack(padx=15, pady=(5, 0))
+            val_lbl = tk.Label(box, text="0", bg="white", fg="#111",
+                                font=("Segoe UI", 16, "bold"))
+            val_lbl.pack(padx=15, pady=(0, 5))
+            self.summary_labels[name] = val_lbl
+
+        # ---- Verifies name lists, one column per final status ----
+        lists_frame = tk.Frame(bottom, bg="#f0f2f5", pady=6)
+        lists_frame.pack(fill="both", expand=True)
+
+        self.list_boxes = {}
+        for name, color in SYRS_SUMMARY_ACCENTS.items():
+            if name == "Total":
+                continue
+            col_frame = tk.Frame(lists_frame, bg="white", bd=1, relief="solid")
+            col_frame.pack(side="left", expand=True, fill="both", padx=10)
+
+            tk.Label(col_frame, text=f"{name} Verifies", bg="white", fg=color,
+                     font=("Segoe UI", 10, "bold")).pack(pady=(8, 4))
+
+            list_container = tk.Frame(col_frame, bg="white")
+            list_container.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+            sb = ttk.Scrollbar(list_container, orient="vertical")
+            lb = tk.Listbox(list_container, font=("Segoe UI", 9),
+                             yscrollcommand=sb.set, height=8,
+                             relief="flat", bd=0, highlightthickness=1,
+                             highlightbackground="#ddd")
+            sb.config(command=lb.yview)
+            sb.pack(side="right", fill="y")
+            lb.pack(side="left", fill="both", expand=True)
+
+            self.list_boxes[name] = lb
+
+    # ---------------- Logic ----------------
+    def upload_file(self):
+        path = filedialog.askopenfilename(
+            title="Select Excel or CSV File",
+            filetypes=[
+                ("Excel/CSV files", "*.xlsx *.xls *.xlsm *.csv"),
+                ("Excel files", "*.xlsx *.xls *.xlsm"),
+                ("CSV files", "*.csv"),
+            ]
+        )
+        if not path:
+            return
+
+        try:
+            self.df = load_file(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read the file:\n{e}")
+            return
+
+        if self.df is None or self.df.empty:
+            messagebox.showwarning("Empty File", "No data was found in that file.")
+            return
+
+        self.lbl_file.config(text=os.path.basename(path))
+        self._populate_column_pickers()
+        self._populate_raw_table()
+        self._reset_summary()
+
+    def _populate_column_pickers(self):
+        cols = list(self.df.columns)
+        self.verify_col_combo["values"] = cols
+        self.result_col_combo["values"] = cols
+
+        self.verify_col_var.set(guess_column(cols, ["verifies", "verify", "requirement", "syrs", "id"]))
+        self.result_col_var.set(guess_column(cols, ["result", "status"]))
+
+    def _populate_raw_table(self):
+        self.tree.delete(*self.tree.get_children())
+        columns = list(self.df.columns)
+        self.tree["columns"] = columns
+
+        for col in columns:
+            self.tree.heading(col, text=col, anchor="center")
+            longest = max(
+                [len(str(col))] + [len(str(v)) for v in self.df[col].astype(str).values[:500]]
+            )
+            width = min(MAX_COL_WIDTH, max(MIN_COL_WIDTH, longest * CHAR_PIXEL_WIDTH))
+            self.tree.column(col, width=width, anchor="w", stretch=False)
+
+        for idx, (_, row) in enumerate(self.df.iterrows()):
+            band_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            self.tree.insert("", "end", iid=str(idx), values=list(row), tags=(band_tag,))
+
+    def _reset_summary(self):
+        for lbl in self.summary_labels.values():
+            lbl.config(text="0")
+        for lb in self.list_boxes.values():
+            lb.delete(0, tk.END)
+
+    def _merge_status(self, raw_status):
+        """Fold Not Testable + Blocked into a single 'Blocked' bucket."""
+        if raw_status in ("Not Testable", "Blocked"):
+            return "Blocked"
+        return raw_status  # "Pass", "Fail", or None
+
+    def analyze(self):
+        if self.df is None:
+            messagebox.showwarning("No Data", "Please upload a file first.")
+            return
+
+        verify_col = self.verify_col_var.get()
+        result_col = self.result_col_var.get()
+
+        if not verify_col or verify_col not in self.df.columns:
+            messagebox.showwarning("No Column", "Please select a valid Verifies column.")
+            return
+        if not result_col or result_col not in self.df.columns:
+            messagebox.showwarning("No Column", "Please select a valid Result column.")
+            return
+        if verify_col == result_col:
+            messagebox.showwarning("Same Column", "Verifies column and Result column must be different.")
+            return
+
+        # ---- Step 1: classify every row, merging Not Testable + Blocked ----
+        row_merged_status = []          # merged status per row, in row order
+        statuses_seen_per_id = {}       # verify_id -> set of merged statuses
+        occurrences_per_id = {}         # verify_id -> row count (to spot duplicates)
+        unmatched = 0
+
+        for idx, row in self.df.iterrows():
+            vid = str(row[verify_col]).strip()
+            raw = classify_status(row[result_col])
+            merged = self._merge_status(raw)
+            row_merged_status.append(merged)
+
+            if merged is None and str(row[result_col]).strip():
+                unmatched += 1
+
+            if vid:
+                occurrences_per_id[vid] = occurrences_per_id.get(vid, 0) + 1
+                if merged:
+                    statuses_seen_per_id.setdefault(vid, set()).add(merged)
+
+        # ---- Step 2: resolve ONE final verdict per Verifies id ----
+        # Each id is decided individually (its own set of statuses), not by
+        # comparing it against every other id. Priority: Blocked > Fail > Pass.
+        final_status_per_id = {}
+        for vid, statuses in statuses_seen_per_id.items():
+            for level in SYRS_PRIORITY:
+                if level in statuses:
+                    final_status_per_id[vid] = level
+                    break
+
+        # ---- Step 3: remove duplicates -> one unique, final list per bucket ----
+        pass_ids = sorted({v for v, s in final_status_per_id.items() if s == "Pass"})
+        fail_ids = sorted({v for v, s in final_status_per_id.items() if s == "Fail"})
+        blocked_ids = sorted({v for v, s in final_status_per_id.items() if s == "Blocked"})
+
+        # ---- Step 4: conditional formatting on the raw table ----
+        # - Row background reflects the FINAL verdict of that row's Verifies id.
+        # - Rows whose Verifies id occurs more than once (duplicates) get an
+        #   extra highlight so conflicting/duplicate test rows stand out.
+        for idx, row in self.df.iterrows():
+            vid = str(row[verify_col]).strip()
+            band_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            tags = [band_tag]
+
+            final = final_status_per_id.get(vid)
+            if final:
+                tags.append(f"final_{final}")
+            if vid and occurrences_per_id.get(vid, 0) > 1:
+                tags.append("duplicate")
+
+            self.tree.item(str(idx), tags=tuple(tags))
+
+        # ---- Step 5: update counts ----
+        self.summary_labels["Pass"].config(text=str(len(pass_ids)))
+        self.summary_labels["Fail"].config(text=str(len(fail_ids)))
+        self.summary_labels["Blocked"].config(text=str(len(blocked_ids)))
+        self.summary_labels["Total"].config(text=str(len(final_status_per_id)))
+
+        # ---- Step 6: update the Verifies-name lists ----
+        self.list_boxes["Pass"].delete(0, tk.END)
+        self.list_boxes["Fail"].delete(0, tk.END)
+        self.list_boxes["Blocked"].delete(0, tk.END)
+        for vid in pass_ids:
+            self.list_boxes["Pass"].insert(tk.END, vid)
+        for vid in fail_ids:
+            self.list_boxes["Fail"].insert(tk.END, vid)
+        for vid in blocked_ids:
+            self.list_boxes["Blocked"].insert(tk.END, vid)
+
+        dup_count = sum(1 for c in occurrences_per_id.values() if c > 1)
+        msg_parts = []
+        if dup_count:
+            msg_parts.append(
+                f"{dup_count} Verifies id(s) appeared on more than one row and were "
+                f"resolved to a single final verdict (priority: Blocked > Fail > Pass)."
+            )
+        if unmatched:
+            msg_parts.append(
+                f"{unmatched} row(s) had a value in '{result_col}' that didn't match "
+                f"Pass/Fail/Not Testable/Blocked and were ignored."
+            )
+        if msg_parts:
+            messagebox.showinfo("Note", "\n\n".join(msg_parts))
+
+
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    login = LoginWindow()
+    login.mainloop()
