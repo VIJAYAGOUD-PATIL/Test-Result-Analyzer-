@@ -1,0 +1,206 @@
+"""
+vlookup_testcases.py
+---------------------
+Does an Excel-style VLOOKUP between two files based on a "Testcase Id" column.
+
+Given:
+  - a SOURCE file/sheet that has Testcase Id, Result, Comment (the "lookup table")
+  - a TARGET file/sheet that has a list of Testcase Ids you want filled in
+
+It matches rows by Testcase Id and copies the Result and Comment values from the
+source into the target, then writes the combined result into a sheet name you
+choose (in a new or existing output file).
+
+Supports .xlsx, .xlsm, .xls, and .csv for both input files.
+
+Usage:
+    python vlookup_testcases.py
+
+    (fully interactive - it will prompt you for file paths, sheet names,
+    column names, and where to save the output)
+
+Or non-interactively:
+    python vlookup_testcases.py \
+        --source source.xlsx --source-sheet "Sheet1" \
+        --target target.xlsx --target-sheet "Sheet1" \
+        --output result.xlsx --output-sheet "Merged" \
+        --key-col "Testcase Id" --copy-cols "Result,Comment"
+
+Dependencies (install if missing):
+    pip install pandas openpyxl xlrd --break-system-packages
+"""
+
+import argparse
+import os
+import sys
+
+import pandas as pd
+from openpyxl import load_workbook, Workbook
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def is_csv(path: str) -> bool:
+    return path.lower().endswith(".csv")
+
+
+def list_sheets(path: str):
+    """Return sheet names for an Excel file, or None for CSV files."""
+    if is_csv(path):
+        return None
+    try:
+        xls = pd.ExcelFile(path)
+        return xls.sheet_names
+    except Exception as e:
+        print(f"Could not read sheets from '{path}': {e}")
+        sys.exit(1)
+
+
+def load_sheet(path: str, sheet_name=None) -> pd.DataFrame:
+    """Load a DataFrame from a csv/xlsx/xls/xlsm file."""
+    if is_csv(path):
+        return pd.read_csv(path)
+    return pd.read_excel(path, sheet_name=sheet_name)
+
+
+def prompt(msg: str, default: str = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{msg}{suffix}: ").strip()
+    return val if val else default
+
+
+def pick_sheet(path: str, role: str, given: str = None) -> str:
+    sheets = list_sheets(path)
+    if sheets is None:  # CSV
+        return None
+    if given and given in sheets:
+        return given
+    if len(sheets) == 1:
+        return sheets[0]
+    print(f"\nSheets found in {role} file '{path}':")
+    for i, s in enumerate(sheets, 1):
+        print(f"  {i}. {s}")
+    choice = prompt(f"Pick the {role} sheet (name or number)", sheets[0])
+    if choice.isdigit() and 1 <= int(choice) <= len(sheets):
+        return sheets[int(choice) - 1]
+    if choice in sheets:
+        return choice
+    print(f"'{choice}' not found, defaulting to '{sheets[0]}'")
+    return sheets[0]
+
+
+def find_column(df: pd.DataFrame, wanted: str) -> str:
+    """Case-insensitive / whitespace-insensitive column match."""
+    norm = lambda s: str(s).strip().lower().replace(" ", "").replace("_", "")
+    target = norm(wanted)
+    for col in df.columns:
+        if norm(col) == target:
+            return col
+    raise KeyError(
+        f"Column '{wanted}' not found. Available columns: {list(df.columns)}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Core logic
+# --------------------------------------------------------------------------
+
+def do_vlookup(source_df, target_df, key_col, copy_cols):
+    src_key = find_column(source_df, key_col)
+    tgt_key = find_column(target_df, key_col)
+
+    resolved_copy_cols = []
+    for c in copy_cols:
+        resolved_copy_cols.append(find_column(source_df, c))
+
+    # keep only key + copy columns from source, avoid duplicate-key issues
+    lookup = source_df[[src_key] + resolved_copy_cols].drop_duplicates(subset=[src_key])
+    lookup = lookup.rename(columns={src_key: tgt_key})
+
+    merged = target_df.merge(lookup, on=tgt_key, how="left", suffixes=("", "_looked_up"))
+
+    unmatched = merged[merged[resolved_copy_cols[0]].isna()][tgt_key].tolist()
+    if unmatched:
+        print(f"\nWarning: {len(unmatched)} Testcase Id(s) in target had no match in source:")
+        print(", ".join(str(u) for u in unmatched[:20]) + (" ..." if len(unmatched) > 20 else ""))
+
+    return merged
+
+
+def write_output(merged_df: pd.DataFrame, output_path: str, output_sheet: str):
+    if os.path.exists(output_path) and not is_csv(output_path):
+        # append/replace a sheet inside an existing workbook, keep other sheets intact
+        book = load_workbook(output_path)
+        if output_sheet in book.sheetnames:
+            del book[output_sheet]
+        ws = book.create_sheet(output_sheet)
+        _write_df_to_ws(merged_df, ws)
+        book.save(output_path)
+    elif is_csv(output_path):
+        merged_df.to_csv(output_path, index=False)
+    else:
+        book = Workbook()
+        ws = book.active
+        ws.title = output_sheet
+        _write_df_to_ws(merged_df, ws)
+        book.save(output_path)
+
+
+def _write_df_to_ws(df: pd.DataFrame, ws):
+    ws.append(list(df.columns))
+    for row in df.itertuples(index=False):
+        ws.append(list(row))
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="VLOOKUP two Excel files by Testcase Id")
+    parser.add_argument("--source")
+    parser.add_argument("--source-sheet")
+    parser.add_argument("--target")
+    parser.add_argument("--target-sheet")
+    parser.add_argument("--output")
+    parser.add_argument("--output-sheet")
+    parser.add_argument("--key-col", default="Testcase Id")
+    parser.add_argument("--copy-cols", default="Result,Comment")
+    args = parser.parse_args()
+
+    print("=== Excel VLOOKUP by Testcase Id ===\n")
+
+    source = args.source or prompt("Path to SOURCE Excel file (has Result/Comment to copy FROM)")
+    while not os.path.exists(source):
+        print("File not found.")
+        source = prompt("Path to SOURCE Excel file")
+    source_sheet = pick_sheet(source, "source", args.source_sheet)
+
+    target = args.target or prompt("Path to TARGET Excel file (has Testcase Ids to fill IN)")
+    while not os.path.exists(target):
+        print("File not found.")
+        target = prompt("Path to TARGET Excel file")
+    target_sheet = pick_sheet(target, "target", args.target_sheet)
+
+    key_col = args.key_col or prompt("Column name to match on", "Testcase Id")
+    copy_cols_raw = args.copy_cols or prompt("Column(s) to copy over (comma-separated)", "Result,Comment")
+    copy_cols = [c.strip() for c in copy_cols_raw.split(",") if c.strip()]
+
+    output = args.output or prompt("Output file path", target)
+    output_sheet = args.output_sheet or prompt("Output sheet name to write results into", "VLOOKUP Result")
+
+    print("\nLoading files...")
+    source_df = load_sheet(source, source_sheet)
+    target_df = load_sheet(target, target_sheet)
+
+    print("Matching on:", key_col, "| Copying:", copy_cols)
+    merged = do_vlookup(source_df, target_df, key_col, copy_cols)
+
+    write_output(merged, output, output_sheet)
+    print(f"\nDone. Results written to '{output}' -> sheet '{output_sheet}'.")
+
+
+if __name__ == "__main__":
+    main()
