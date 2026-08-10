@@ -1,45 +1,43 @@
 """
-vlookup_testcases.py
----------------------
-Does an Excel-style VLOOKUP between two files based on a "Testcase Id" column.
+vlookup_gui.py
+---------------
+Single-file Tkinter GUI that does an Excel-style VLOOKUP between two files
+based on a "Testcase Id" (or any column you choose).
 
-Given:
-  - a SOURCE file/sheet that has Testcase Id, Result, Comment (the "lookup table")
-  - a TARGET file/sheet that has a list of Testcase Ids you want filled in
+- SOURCE file: has Testcase Id, Result, Comment (the "lookup table")
+- TARGET file: has a list of Testcase Ids you want filled in
 
-It matches rows by Testcase Id and copies the Result and Comment values from the
-source into the target, then writes the combined result into a sheet name you
-choose (in a new or existing output file).
+It matches rows by the key column, copies the chosen columns (default:
+Result, Comment) from source into target, and writes the combined result
+into a sheet name you choose, in a file you choose.
 
-Supports .xlsx, .xlsm, .xls, and .csv for both input files.
-
-Usage:
-    python vlookup_testcases.py
-
-    (fully interactive - it will prompt you for file paths, sheet names,
-    column names, and where to save the output)
-
-Or non-interactively:
-    python vlookup_testcases.py \
-        --source source.xlsx --source-sheet "Sheet1" \
-        --target target.xlsx --target-sheet "Sheet1" \
-        --output result.xlsx --output-sheet "Merged" \
-        --key-col "Testcase Id" --copy-cols "Result,Comment"
+Supports .xlsx, .xlsm, .xls, and .csv for both inputs.
 
 Dependencies (install if missing):
     pip install pandas openpyxl xlrd --break-system-packages
+    (tkinter ships with standard Python on Windows/Mac; on Linux:
+     sudo apt-get install python3-tk)
+
+Run:
+    python vlookup_gui.py
 """
 
-import argparse
 import os
-import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
 from openpyxl import load_workbook, Workbook
 
+FILETYPES = [
+    ("Excel / CSV files", "*.xlsx *.xls *.xlsm *.csv"),
+    ("All files", "*.*"),
+]
+
 
 # --------------------------------------------------------------------------
-# Helpers
+# Core VLOOKUP logic
 # --------------------------------------------------------------------------
 
 def is_csv(path: str) -> bool:
@@ -50,12 +48,8 @@ def list_sheets(path: str):
     """Return sheet names for an Excel file, or None for CSV files."""
     if is_csv(path):
         return None
-    try:
-        xls = pd.ExcelFile(path)
-        return xls.sheet_names
-    except Exception as e:
-        print(f"Could not read sheets from '{path}': {e}")
-        sys.exit(1)
+    xls = pd.ExcelFile(path)
+    return xls.sheet_names
 
 
 def load_sheet(path: str, sheet_name=None) -> pd.DataFrame:
@@ -65,87 +59,27 @@ def load_sheet(path: str, sheet_name=None) -> pd.DataFrame:
     return pd.read_excel(path, sheet_name=sheet_name)
 
 
-def prompt(msg: str, default: str = None) -> str:
-    suffix = f" [{default}]" if default else ""
-    val = input(f"{msg}{suffix}: ").strip()
-    return val if val else default
-
-
-def pick_sheet(path: str, role: str, given: str = None) -> str:
-    sheets = list_sheets(path)
-    if sheets is None:  # CSV
-        return None
-    if given and given in sheets:
-        return given
-    if len(sheets) == 1:
-        return sheets[0]
-    print(f"\nSheets found in {role} file '{path}':")
-    for i, s in enumerate(sheets, 1):
-        print(f"  {i}. {s}")
-    choice = prompt(f"Pick the {role} sheet (name or number)", sheets[0])
-    if choice.isdigit() and 1 <= int(choice) <= len(sheets):
-        return sheets[int(choice) - 1]
-    if choice in sheets:
-        return choice
-    print(f"'{choice}' not found, defaulting to '{sheets[0]}'")
-    return sheets[0]
-
-
 def find_column(df: pd.DataFrame, wanted: str) -> str:
-    """Case-insensitive / whitespace-insensitive column match."""
+    """Case/space/underscore-insensitive column match."""
     norm = lambda s: str(s).strip().lower().replace(" ", "").replace("_", "")
     target = norm(wanted)
     for col in df.columns:
         if norm(col) == target:
             return col
-    raise KeyError(
-        f"Column '{wanted}' not found. Available columns: {list(df.columns)}"
-    )
+    raise KeyError(f"Column '{wanted}' not found. Available columns: {list(df.columns)}")
 
 
-# --------------------------------------------------------------------------
-# Core logic
-# --------------------------------------------------------------------------
-
-def do_vlookup(source_df, target_df, key_col, copy_cols):
+def do_vlookup(source_df: pd.DataFrame, target_df: pd.DataFrame, key_col: str, copy_cols: list):
     src_key = find_column(source_df, key_col)
     tgt_key = find_column(target_df, key_col)
 
-    resolved_copy_cols = []
-    for c in copy_cols:
-        resolved_copy_cols.append(find_column(source_df, c))
+    resolved_copy_cols = [find_column(source_df, c) for c in copy_cols]
 
-    # keep only key + copy columns from source, avoid duplicate-key issues
     lookup = source_df[[src_key] + resolved_copy_cols].drop_duplicates(subset=[src_key])
     lookup = lookup.rename(columns={src_key: tgt_key})
 
     merged = target_df.merge(lookup, on=tgt_key, how="left", suffixes=("", "_looked_up"))
-
-    unmatched = merged[merged[resolved_copy_cols[0]].isna()][tgt_key].tolist()
-    if unmatched:
-        print(f"\nWarning: {len(unmatched)} Testcase Id(s) in target had no match in source:")
-        print(", ".join(str(u) for u in unmatched[:20]) + (" ..." if len(unmatched) > 20 else ""))
-
-    return merged
-
-
-def write_output(merged_df: pd.DataFrame, output_path: str, output_sheet: str):
-    if os.path.exists(output_path) and not is_csv(output_path):
-        # append/replace a sheet inside an existing workbook, keep other sheets intact
-        book = load_workbook(output_path)
-        if output_sheet in book.sheetnames:
-            del book[output_sheet]
-        ws = book.create_sheet(output_sheet)
-        _write_df_to_ws(merged_df, ws)
-        book.save(output_path)
-    elif is_csv(output_path):
-        merged_df.to_csv(output_path, index=False)
-    else:
-        book = Workbook()
-        ws = book.active
-        ws.title = output_sheet
-        _write_df_to_ws(merged_df, ws)
-        book.save(output_path)
+    return merged, resolved_copy_cols
 
 
 def _write_df_to_ws(df: pd.DataFrame, ws):
@@ -154,53 +88,207 @@ def _write_df_to_ws(df: pd.DataFrame, ws):
         ws.append(list(row))
 
 
+def write_output(merged_df: pd.DataFrame, output_path: str, output_sheet: str):
+    if is_csv(output_path):
+        merged_df.to_csv(output_path, index=False)
+    elif os.path.exists(output_path):
+        book = load_workbook(output_path)
+        if output_sheet in book.sheetnames:
+            del book[output_sheet]
+        ws = book.create_sheet(output_sheet)
+        _write_df_to_ws(merged_df, ws)
+        book.save(output_path)
+    else:
+        book = Workbook()
+        ws = book.active
+        ws.title = output_sheet
+        _write_df_to_ws(merged_df, ws)
+        book.save(output_path)
+
+
 # --------------------------------------------------------------------------
-# Main
+# GUI
 # --------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="VLOOKUP two Excel files by Testcase Id")
-    parser.add_argument("--source")
-    parser.add_argument("--source-sheet")
-    parser.add_argument("--target")
-    parser.add_argument("--target-sheet")
-    parser.add_argument("--output")
-    parser.add_argument("--output-sheet")
-    parser.add_argument("--key-col", default="Testcase Id")
-    parser.add_argument("--copy-cols", default="Result,Comment")
-    args = parser.parse_args()
+class VLookupApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Excel VLOOKUP by Testcase Id")
+        self.geometry("640x560")
+        self.resizable(False, False)
 
-    print("=== Excel VLOOKUP by Testcase Id ===\n")
+        pad = {"padx": 10, "pady": 6}
 
-    source = args.source or prompt("Path to SOURCE Excel file (has Result/Comment to copy FROM)")
-    while not os.path.exists(source):
-        print("File not found.")
-        source = prompt("Path to SOURCE Excel file")
-    source_sheet = pick_sheet(source, "source", args.source_sheet)
+        # ---------------- Source file ----------------
+        frm_src = ttk.LabelFrame(self, text="1. Source file (has Result / Comment to copy FROM)")
+        frm_src.pack(fill="x", **pad)
 
-    target = args.target or prompt("Path to TARGET Excel file (has Testcase Ids to fill IN)")
-    while not os.path.exists(target):
-        print("File not found.")
-        target = prompt("Path to TARGET Excel file")
-    target_sheet = pick_sheet(target, "target", args.target_sheet)
+        self.source_path = tk.StringVar()
+        ttk.Entry(frm_src, textvariable=self.source_path, width=55).grid(row=0, column=0, padx=5, pady=5)
+        ttk.Button(frm_src, text="Browse...", command=self.browse_source).grid(row=0, column=1, padx=5)
 
-    key_col = args.key_col or prompt("Column name to match on", "Testcase Id")
-    copy_cols_raw = args.copy_cols or prompt("Column(s) to copy over (comma-separated)", "Result,Comment")
-    copy_cols = [c.strip() for c in copy_cols_raw.split(",") if c.strip()]
+        ttk.Label(frm_src, text="Sheet:").grid(row=1, column=0, sticky="w", padx=5)
+        self.source_sheet = tk.StringVar()
+        self.source_sheet_combo = ttk.Combobox(frm_src, textvariable=self.source_sheet, state="readonly", width=30)
+        self.source_sheet_combo.grid(row=1, column=1, sticky="w", padx=5, pady=5)
 
-    output = args.output or prompt("Output file path", target)
-    output_sheet = args.output_sheet or prompt("Output sheet name to write results into", "VLOOKUP Result")
+        # ---------------- Target file ----------------
+        frm_tgt = ttk.LabelFrame(self, text="2. Target file (has Testcase Ids to fill IN)")
+        frm_tgt.pack(fill="x", **pad)
 
-    print("\nLoading files...")
-    source_df = load_sheet(source, source_sheet)
-    target_df = load_sheet(target, target_sheet)
+        self.target_path = tk.StringVar()
+        ttk.Entry(frm_tgt, textvariable=self.target_path, width=55).grid(row=0, column=0, padx=5, pady=5)
+        ttk.Button(frm_tgt, text="Browse...", command=self.browse_target).grid(row=0, column=1, padx=5)
 
-    print("Matching on:", key_col, "| Copying:", copy_cols)
-    merged = do_vlookup(source_df, target_df, key_col, copy_cols)
+        ttk.Label(frm_tgt, text="Sheet:").grid(row=1, column=0, sticky="w", padx=5)
+        self.target_sheet = tk.StringVar()
+        self.target_sheet_combo = ttk.Combobox(frm_tgt, textvariable=self.target_sheet, state="readonly", width=30)
+        self.target_sheet_combo.grid(row=1, column=1, sticky="w", padx=5, pady=5)
 
-    write_output(merged, output, output_sheet)
-    print(f"\nDone. Results written to '{output}' -> sheet '{output_sheet}'.")
+        # ---------------- Columns ----------------
+        frm_cols = ttk.LabelFrame(self, text="3. Matching & columns to copy")
+        frm_cols.pack(fill="x", **pad)
+
+        ttk.Label(frm_cols, text="Match on column:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.key_col = tk.StringVar(value="Testcase Id")
+        ttk.Entry(frm_cols, textvariable=self.key_col, width=30).grid(row=0, column=1, sticky="w", padx=5)
+
+        ttk.Label(frm_cols, text="Columns to copy (comma-separated):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.copy_cols = tk.StringVar(value="Result,Comment")
+        ttk.Entry(frm_cols, textvariable=self.copy_cols, width=30).grid(row=1, column=1, sticky="w", padx=5)
+
+        # ---------------- Output ----------------
+        frm_out = ttk.LabelFrame(self, text="4. Output")
+        frm_out.pack(fill="x", **pad)
+
+        ttk.Label(frm_out, text="Save to file:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.output_path = tk.StringVar()
+        ttk.Entry(frm_out, textvariable=self.output_path, width=45).grid(row=0, column=1, padx=5)
+        ttk.Button(frm_out, text="Browse...", command=self.browse_output).grid(row=0, column=2, padx=5)
+
+        ttk.Label(frm_out, text="Output sheet name:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.output_sheet = tk.StringVar(value="VLOOKUP Result")
+        ttk.Entry(frm_out, textvariable=self.output_sheet, width=30).grid(row=1, column=1, sticky="w", padx=5)
+
+        # ---------------- Run ----------------
+        self.run_btn = ttk.Button(self, text="Run VLOOKUP", command=self.run_clicked)
+        self.run_btn.pack(pady=10)
+
+        # ---------------- Log ----------------
+        frm_log = ttk.LabelFrame(self, text="Status / Log")
+        frm_log.pack(fill="both", expand=True, **pad)
+        self.log = tk.Text(frm_log, height=12, wrap="word", state="disabled")
+        self.log.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # ---------------- Browsing ----------------
+    def browse_source(self):
+        path = filedialog.askopenfilename(title="Select source file", filetypes=FILETYPES)
+        if path:
+            self.source_path.set(path)
+            self.populate_sheets(path, self.source_sheet_combo, self.source_sheet)
+
+    def browse_target(self):
+        path = filedialog.askopenfilename(title="Select target file", filetypes=FILETYPES)
+        if path:
+            self.target_path.set(path)
+            self.populate_sheets(path, self.target_sheet_combo, self.target_sheet)
+            if not self.output_path.get():
+                self.output_path.set(path)
+
+    def browse_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Choose output file",
+            defaultextension=".xlsx",
+            filetypes=[("Excel file", "*.xlsx"), ("CSV file", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self.output_path.set(path)
+
+    def populate_sheets(self, path, combo, var):
+        if is_csv(path):
+            combo["values"] = []
+            var.set("")
+            combo.set("(CSV file - no sheets)")
+            combo.configure(state="disabled")
+            return
+        try:
+            sheets = list_sheets(path)
+        except Exception as e:
+            self.log_msg(f"Could not read sheets from '{path}': {e}")
+            sheets = []
+        combo.configure(state="readonly")
+        combo["values"] = sheets
+        if sheets:
+            var.set(sheets[0])
+
+    # ---------------- Logging ----------------
+    def log_msg(self, msg):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+        self.update_idletasks()
+
+    # ---------------- Run ----------------
+    def run_clicked(self):
+        source = self.source_path.get().strip()
+        target = self.target_path.get().strip()
+        output = self.output_path.get().strip()
+        output_sheet = self.output_sheet.get().strip() or "VLOOKUP Result"
+        key_col = self.key_col.get().strip() or "Testcase Id"
+        copy_cols = [c.strip() for c in self.copy_cols.get().split(",") if c.strip()]
+
+        if not source or not os.path.exists(source):
+            messagebox.showerror("Missing source", "Please choose a valid source file.")
+            return
+        if not target or not os.path.exists(target):
+            messagebox.showerror("Missing target", "Please choose a valid target file.")
+            return
+        if not output:
+            messagebox.showerror("Missing output", "Please choose where to save the output.")
+            return
+        if not copy_cols:
+            messagebox.showerror("Missing columns", "Please enter at least one column to copy.")
+            return
+
+        self.run_btn.configure(state="disabled")
+        self.log_msg("Starting...")
+
+        thread = threading.Thread(
+            target=self._do_run,
+            args=(source, self.source_sheet.get(), target, self.target_sheet.get(),
+                  output, output_sheet, key_col, copy_cols),
+            daemon=True,
+        )
+        thread.start()
+
+    def _do_run(self, source, source_sheet, target, target_sheet, output, output_sheet, key_col, copy_cols):
+        try:
+            self.log_msg(f"Loading source: {source} [{source_sheet or 'CSV'}]")
+            source_df = load_sheet(source, source_sheet if source_sheet else None)
+
+            self.log_msg(f"Loading target: {target} [{target_sheet or 'CSV'}]")
+            target_df = load_sheet(target, target_sheet if target_sheet else None)
+
+            self.log_msg(f"Matching on '{key_col}', copying {copy_cols} ...")
+            merged, resolved_copy_cols = do_vlookup(source_df, target_df, key_col, copy_cols)
+
+            unmatched_count = int(merged[resolved_copy_cols[0]].isna().sum())
+            if unmatched_count:
+                self.log_msg(f"Warning: {unmatched_count} Testcase Id(s) had no match in source.")
+
+            self.log_msg(f"Writing output to '{output}' -> sheet '{output_sheet}' ...")
+            write_output(merged, output, output_sheet)
+
+            self.log_msg("Done!")
+            messagebox.showinfo("Success", f"Results written to:\n{output}\nSheet: {output_sheet}")
+        except Exception as e:
+            self.log_msg(f"ERROR: {e}")
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.run_btn.configure(state="normal")
 
 
 if __name__ == "__main__":
-    main()
+    app = VLookupApp()
+    app.mainloop()
